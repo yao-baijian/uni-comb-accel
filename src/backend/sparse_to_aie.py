@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from src.backend.tcsr import TCSRData, generate_tcsr
+from src.backend.sparse_formats import SparseFormat, normalize_sparse_format
 
 
 @dataclass
@@ -36,11 +37,15 @@ class SparseToAIEPass:
     )
     _FUNC_HEADER_PATTERN = re.compile(r"^\s*func\.func\s+@", re.MULTILINE)
 
-    def __init__(self, tile_rows: int = 32, tile_cols: int = 32) -> None:
+    def __init__(self, tile_rows: int = 32, tile_cols: int = 32, sparse_format: Optional[str] = None) -> None:
         self.tile_rows = tile_rows
         self.tile_cols = tile_cols
+        self.sparse_format = normalize_sparse_format(sparse_format)
 
     def run(self, mlir_text: str) -> SparseLoweringResult:
+        if self.sparse_format != SparseFormat.TCSR:
+            return SparseLoweringResult(transformed_mlir=mlir_text, tcsr=None, changed=False)
+
         if not self._SPARSE_OP_PATTERN.search(mlir_text):
             return SparseLoweringResult(transformed_mlir=mlir_text, tcsr=None, changed=False)
 

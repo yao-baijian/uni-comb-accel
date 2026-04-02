@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import inspect
+import json
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence, Union
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
-from src.backend.aries_backend import ARIESBackend
+from src.backend.aries_backend import ARIESBackend, ARIESBackendConfig
+from src.backend.precision import Precision, normalize_precision
+from src.backend.sparse_formats import SparseFormat, normalize_sparse_format
 from src.compiler.autodiff import combine_modules, get_forward_backward_mlir, module_to_text
 from src.compiler.frontend import PythonToMLIR, VariableSpec
 
@@ -17,6 +20,9 @@ VariableInput = Union[
     None,
 ]
 
+_DEFAULT_PROBLEM_SESSION = None
+_DEFAULT_BOARD_RUNTIME = None
+
 
 def compile_energy_function(
     func,
@@ -25,6 +31,12 @@ def compile_energy_function(
     output_dir="build",
     use_omeinsum: bool = True,
     julia_cmd: str = "julia",
+    gradient_mode: str = "auto",
+    variables: VariableInput = None,
+    sparse_format: Union[str, SparseFormat] = SparseFormat.TCSR,
+    precision: Union[str, Precision] = Precision.FP32,
+    expected_input_shapes: Optional[Mapping[str, Sequence[int]]] = None,
+    auto_aie_config: bool = True,
 ):
     """
     将 Python 能量函数（含自动微分）编译为 AIE/PE 可执行代码。
@@ -35,13 +47,38 @@ def compile_energy_function(
     - output_dir: 输出目录
     """
 
+    gradient_mode = str(gradient_mode).strip().lower()
+    if gradient_mode not in {"auto", "manual"}:
+        raise ValueError("gradient_mode must be one of: 'auto', 'manual'")
+
     target = str(target).lower()
     if target not in {"aie", "pe", "hybrid"}:
         raise ValueError("target must be one of: 'aie', 'pe', 'hybrid'")
 
+    precision_value = normalize_precision(precision)
+    sparse_format_value = normalize_sparse_format(sparse_format)
+
+    if gradient_mode == "manual":
+        return compile_energy_function_legacy(
+            func,
+            variables,
+            target=target,
+            output_dir=output_dir,
+            sparse_format=sparse_format_value,
+            precision=precision_value,
+        )
+
     if not isinstance(example_args, (tuple, list)):
         example_args = (example_args,)
     example_args = tuple(example_args)
+    example_args = _cast_example_args_to_precision(example_args, precision_value)
+
+    aie_config = _build_aie_config(
+        func=func,
+        example_args=example_args,
+        expected_input_shapes=expected_input_shapes,
+        auto_aie_config=auto_aie_config,
+    )
 
     # 1. 自动微分并生成 forward/backward MLIR
     fwd_mod, bwd_mod = get_forward_backward_mlir(
@@ -68,13 +105,22 @@ def compile_energy_function(
     combined_mlir_path.write_text(combined_text, encoding="utf-8")
 
     # 2. 交给 ARIES 后端优化
-    backend = ARIESBackend()
+    backend = ARIESBackend(
+        config=ARIESBackendConfig(
+            sparse_tile_rows=int(aie_config["sparse_tile_rows"]),
+            sparse_tile_cols=int(aie_config["sparse_tile_cols"]),
+        )
+    )
     optimized_mlir = backend.optimize(
         combined_text,
         extra_args=["-canonicalize", "-cse"],
+        sparse_format=sparse_format_value,
+        precision=precision_value,
     )
     opt_mlir_path = out_dir / f"{func_name}.combined.opt.mlir"
     opt_mlir_path.write_text(optimized_mlir, encoding="utf-8")
+    aie_cfg_path = out_dir / f"{func_name}.aie_config.json"
+    aie_cfg_path.write_text(json.dumps(aie_config, indent=2), encoding="utf-8")
 
     artifacts: Dict[str, str] = {
         "forward_mlir": str(fwd_mlir_path),
@@ -82,6 +128,10 @@ def compile_energy_function(
         "combined_mlir": str(combined_mlir_path),
         "optimized_mlir": str(opt_mlir_path),
         "target": target,
+        "gradient_mode": gradient_mode,
+        "sparse_format": sparse_format_value.value,
+        "precision": precision_value.value,
+        "aie_config": str(aie_cfg_path),
     }
 
     # 3. 调用 ARIES 代码生成
@@ -109,14 +159,33 @@ def compile_energy_function(
     return artifacts
 
 
-def compile_energy_function_legacy(func, variables, target="aie", output_dir="build/"):
+def compile_energy_function_legacy(
+    func,
+    variables,
+    target="aie",
+    output_dir="build/",
+    sparse_format: Union[str, SparseFormat] = SparseFormat.TCSR,
+    precision: Union[str, Precision] = Precision.FP32,
+    expected_input_shapes: Optional[Mapping[str, Sequence[int]]] = None,
+    auto_aie_config: bool = True,
+):
     """Legacy entrypoint using handwritten Python AST frontend."""
 
     target = str(target).lower()
     if target not in {"aie", "pe", "hybrid"}:
         raise ValueError("target must be one of: 'aie', 'pe', 'hybrid'")
 
-    var_specs = _normalize_variable_specs(func, variables)
+    precision_value = normalize_precision(precision)
+    sparse_format_value = normalize_sparse_format(sparse_format)
+
+    aie_config = _build_aie_config(
+        func=func,
+        example_args=(),
+        expected_input_shapes=expected_input_shapes,
+        auto_aie_config=auto_aie_config,
+    )
+
+    var_specs = _normalize_variable_specs(func, variables, precision_value)
     frontend = PythonToMLIR(variable_specs=var_specs)
     mlir_module = frontend.lower(func, output="text")
 
@@ -127,15 +196,31 @@ def compile_energy_function_legacy(func, variables, target="aie", output_dir="bu
     input_mlir_path = out_dir / f"{func_name}.mlir"
     input_mlir_path.write_text(mlir_module, encoding="utf-8")
 
-    backend = ARIESBackend()
-    optimized_mlir = backend.optimize(mlir_module, extra_args=["-canonicalize", "-cse"])
+    backend = ARIESBackend(
+        config=ARIESBackendConfig(
+            sparse_tile_rows=int(aie_config["sparse_tile_rows"]),
+            sparse_tile_cols=int(aie_config["sparse_tile_cols"]),
+        )
+    )
+    optimized_mlir = backend.optimize(
+        mlir_module,
+        extra_args=["-canonicalize", "-cse"],
+        sparse_format=sparse_format_value,
+        precision=precision_value,
+    )
     opt_mlir_path = out_dir / f"{func_name}.opt.mlir"
     opt_mlir_path.write_text(optimized_mlir, encoding="utf-8")
+    aie_cfg_path = out_dir / f"{func_name}.aie_config.json"
+    aie_cfg_path.write_text(json.dumps(aie_config, indent=2), encoding="utf-8")
 
     artifacts: Dict[str, str] = {
         "input_mlir": str(input_mlir_path),
         "optimized_mlir": str(opt_mlir_path),
         "target": target,
+        "gradient_mode": "manual",
+        "sparse_format": sparse_format_value.value,
+        "precision": precision_value.value,
+        "aie_config": str(aie_cfg_path),
     }
 
     if target == "aie":
@@ -160,23 +245,32 @@ def compile_energy_function_legacy(func, variables, target="aie", output_dir="bu
 def _normalize_variable_specs(
     func: Any,
     variables: VariableInput,
+    precision: Precision,
 ) -> Dict[str, Union[VariableSpec, Dict[str, Any]]]:
     arg_names = list(inspect.signature(func).parameters.keys())
+    dtype = precision.mlir_dtype
 
     if variables is None:
-        return {name: {"dtype": "f64", "shape": (None,)} for name in arg_names}
+        return {name: {"dtype": dtype, "shape": (None,)} for name in arg_names}
 
     if isinstance(variables, Mapping):
         specs: Dict[str, Union[VariableSpec, Dict[str, Any]]] = {}
         for name in arg_names:
             if name not in variables:
-                specs[name] = {"dtype": "f64", "shape": (None,)}
+                specs[name] = {"dtype": dtype, "shape": (None,)}
                 continue
             value = variables[name]
             if isinstance(value, str):
-                specs[name] = {"dtype": value, "shape": (None,)}
+                specs[name] = {"dtype": dtype, "shape": (None,)}
+            elif isinstance(value, VariableSpec):
+                specs[name] = VariableSpec(dtype=dtype, shape=value.shape)
             else:
-                specs[name] = value
+                if isinstance(value, dict):
+                    coerced = dict(value)
+                    coerced["dtype"] = dtype
+                    specs[name] = coerced
+                else:
+                    specs[name] = value
         return specs
 
     if isinstance(variables, Sequence) and not isinstance(variables, (str, bytes)):
@@ -184,9 +278,176 @@ def _normalize_variable_specs(
         specs = {}
         for name in arg_names:
             if name in declared:
-                specs[name] = {"dtype": "f64", "shape": (None,)}
+                specs[name] = {"dtype": dtype, "shape": (None,)}
             else:
-                specs[name] = {"dtype": "f64", "shape": None}
+                specs[name] = {"dtype": dtype, "shape": None}
         return specs
 
     raise TypeError("variables must be a list/tuple of names or a dict of variable specs")
+
+
+def _cast_example_args_to_precision(example_args, precision: Precision):
+    runtime_dtype = precision.runtime_dtype
+    try:
+        import numpy as np
+    except Exception:
+        np = None
+
+    try:
+        import jax.numpy as jnp  # type: ignore
+    except Exception:
+        jnp = None
+
+    if runtime_dtype == "float32":
+        target_dtype = "float32"
+    elif runtime_dtype == "float16":
+        target_dtype = "float16"
+    else:
+        target_dtype = "int8"
+
+    casted = []
+    for value in example_args:
+        if hasattr(value, "astype"):
+            casted.append(value.astype(target_dtype))
+        elif np is not None:
+            casted.append(np.asarray(value, dtype=target_dtype))
+        elif jnp is not None:
+            casted.append(jnp.asarray(value, dtype=target_dtype))
+        else:
+            casted.append(value)
+    return tuple(casted)
+
+
+def _build_aie_config(
+    *,
+    func: Any,
+    example_args,
+    expected_input_shapes: Optional[Mapping[str, Sequence[int]]],
+    auto_aie_config: bool,
+) -> Dict[str, Any]:
+    input_shapes = _resolve_input_shapes(func, example_args, expected_input_shapes)
+
+    if not auto_aie_config:
+        return {
+            "mode": "manual-default",
+            "input_shapes": input_shapes,
+            "estimated_intermediate_elements": _estimate_intermediate_elements(input_shapes),
+            "sparse_tile_rows": 32,
+            "sparse_tile_cols": 32,
+        }
+
+    estimated = _estimate_intermediate_elements(input_shapes)
+    tile = _select_tile_size(estimated)
+    return {
+        "mode": "auto",
+        "input_shapes": input_shapes,
+        "estimated_intermediate_elements": estimated,
+        "sparse_tile_rows": tile,
+        "sparse_tile_cols": tile,
+    }
+
+
+def _resolve_input_shapes(
+    func: Any,
+    example_args,
+    expected_input_shapes: Optional[Mapping[str, Sequence[int]]],
+) -> Dict[str, Tuple[int, ...]]:
+    arg_names = list(inspect.signature(func).parameters.keys())
+    resolved: Dict[str, Tuple[int, ...]] = {}
+
+    if expected_input_shapes is not None:
+        for name in arg_names:
+            user_shape = expected_input_shapes.get(name)
+            if user_shape is None:
+                resolved[name] = (1024,)
+            else:
+                resolved[name] = tuple(int(x) for x in user_shape)
+        return resolved
+
+    for idx, name in enumerate(arg_names):
+        if idx < len(example_args):
+            shp = getattr(example_args[idx], "shape", None)
+            if shp is not None and len(tuple(shp)) > 0:
+                resolved[name] = tuple(int(x) for x in tuple(shp))
+            else:
+                resolved[name] = (1024,)
+        else:
+            resolved[name] = (1024,)
+    return resolved
+
+
+def _estimate_intermediate_elements(input_shapes: Mapping[str, Tuple[int, ...]]) -> int:
+    shapes = [tuple(v) for v in input_shapes.values()]
+    if not shapes:
+        return 1024
+
+    total_inputs = sum(_num_elements(s) for s in shapes)
+    max_input = max(_num_elements(s) for s in shapes)
+
+    matmul_intermediates = 0
+    for i in range(len(shapes) - 1):
+        a = shapes[i]
+        b = shapes[i + 1]
+        if len(a) >= 2 and len(b) >= 2 and a[-1] == b[0]:
+            matmul_intermediates += int(a[0]) * int(b[-1])
+
+    # Heuristic: one copy of inputs + one max scratch + inferred contractions.
+    return int(total_inputs + max_input + matmul_intermediates)
+
+
+def _num_elements(shape: Tuple[int, ...]) -> int:
+    n = 1
+    for dim in shape:
+        n *= max(int(dim), 1)
+    return int(n)
+
+
+def _select_tile_size(estimated_intermediate_elements: int) -> int:
+    if estimated_intermediate_elements <= 262144:
+        return 16
+    if estimated_intermediate_elements <= 1048576:
+        return 32
+    if estimated_intermediate_elements <= 4194304:
+        return 64
+    return 128
+
+
+def get_problem_session(cache_dir: str = "build/problem_cache"):
+    """Return a default two-step problem session manager.
+
+    This manager separates:
+    1) define/compile (artifact reuse when signature unchanged), and
+    2) solve/execute (board-loaded check before execution).
+    """
+
+    global _DEFAULT_PROBLEM_SESSION
+    if _DEFAULT_PROBLEM_SESSION is None:
+        from src.runtime.problem_session import ProblemSessionManager
+
+        _DEFAULT_PROBLEM_SESSION = ProblemSessionManager(cache_dir=cache_dir)
+    return _DEFAULT_PROBLEM_SESSION
+
+
+def get_board_runtime(state_file: str = "build/board_runtime/state.json"):
+    """Return a default persistent board runtime implementation."""
+
+    global _DEFAULT_BOARD_RUNTIME
+    if _DEFAULT_BOARD_RUNTIME is None:
+        from src.runtime.problem_session import FileBoardRuntime
+
+        _DEFAULT_BOARD_RUNTIME = FileBoardRuntime(state_file=state_file)
+    return _DEFAULT_BOARD_RUNTIME
+
+
+def define_problem(*args, **kwargs):
+    """Define and compile (or reuse) a problem through the default session."""
+
+    session = get_problem_session()
+    return session.define_problem(*args, **kwargs)
+
+
+def solve_problem(*args, **kwargs):
+    """Solve a previously-defined problem through the default session."""
+
+    session = get_problem_session()
+    return session.solve_problem(*args, **kwargs)

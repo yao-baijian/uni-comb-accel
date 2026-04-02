@@ -39,8 +39,14 @@ def _dtype_to_mlir(dtype: Any) -> str:
     text = str(dtype)
     if "float32" in text:
         return "f32"
+    if "float16" in text or "half" in text:
+        return "f16"
     if "float64" in text:
         return "f64"
+    if "int8" in text:
+        return "i8"
+    if "int4" in text:
+        return "i4"
     if "int32" in text:
         return "i32"
     if "int64" in text:

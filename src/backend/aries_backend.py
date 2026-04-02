@@ -10,7 +10,9 @@ from pathlib import Path
 from shutil import which
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
+from src.backend.precision import Precision, normalize_precision
 from src.backend.sparse_to_aie import SparseToAIEPass
+from src.backend.sparse_formats import SparseFormat, normalize_sparse_format
 
 
 @dataclass
@@ -22,6 +24,8 @@ class ARIESBackendConfig:
     aries_opt: Optional[Union[str, Path]] = None
     aries_translate: Optional[Union[str, Path]] = None
     enable_sparse_lowering: bool = True
+    sparse_format: Union[str, SparseFormat] = SparseFormat.TCSR
+    precision: Union[str, Precision] = Precision.FP32
     sparse_tile_rows: int = 32
     sparse_tile_cols: int = 32
 
@@ -52,9 +56,13 @@ class ARIESBackend:
         else:
             self.aries_root = Path(self.config.aries_root).resolve()
 
+        self.sparse_format = normalize_sparse_format(self.config.sparse_format)
+        self.precision = normalize_precision(self.config.precision)
+
         self._sparse_pass = SparseToAIEPass(
             tile_rows=self.config.sparse_tile_rows,
             tile_cols=self.config.sparse_tile_cols,
+            sparse_format=self.sparse_format,
         )
 
     def optimize(
@@ -62,6 +70,8 @@ class ARIESBackend:
         mlir_module: Union[str, Any],
         pipeline: Optional[str] = None,
         extra_args: Optional[Sequence[str]] = None,
+        sparse_format: Optional[Union[str, SparseFormat]] = None,
+        precision: Optional[Union[str, Precision]] = None,
         sparse_mapping: Optional[Mapping[str, Union[int, Sequence[int], str]]] = None,
         timeout_sec: int = 120,
     ) -> str:
@@ -71,13 +81,20 @@ class ARIESBackend:
             mlir_module: MLIR text or module object.
             pipeline: Pipeline passed as `--pipeline=<pipeline>`.
             extra_args: Extra command args, for example `['-canonicalize']`.
+            sparse_format: Sparse backend format interface to carry through the pipeline.
+            precision: Logical QUBO variable precision interface.
             sparse_mapping: Optional sparse op -> PE mapping metadata.
             timeout_sec: Subprocess timeout.
         """
 
         mlir_text = self._coerce_mlir_text(mlir_module)
+        sparse_format_value = normalize_sparse_format(sparse_format or self.sparse_format)
+        precision_value = normalize_precision(precision or self.precision)
 
-        if self.config.enable_sparse_lowering:
+        mlir_text = self._inject_sparse_format_attr(mlir_text, sparse_format_value)
+        mlir_text = self._inject_precision_attr(mlir_text, precision_value)
+
+        if self.config.enable_sparse_lowering and sparse_format_value == SparseFormat.TCSR:
             sparse_result = self._sparse_pass.run(mlir_text)
             mlir_text = sparse_result.transformed_mlir
 
@@ -154,6 +171,26 @@ class ARIESBackend:
 
         mlir_text = self._coerce_mlir_text(mlir_module)
         return self._inject_sparse_mapping_attr(mlir_text, mapping)
+
+    def annotate_sparse_format(
+        self,
+        mlir_module: Union[str, Any],
+        sparse_format: Optional[Union[str, SparseFormat]],
+    ) -> str:
+        """Attach sparse format metadata as a module attribute."""
+
+        mlir_text = self._coerce_mlir_text(mlir_module)
+        return self._inject_sparse_format_attr(mlir_text, normalize_sparse_format(sparse_format))
+
+    def annotate_precision(
+        self,
+        mlir_module: Union[str, Any],
+        precision: Optional[Union[str, Precision]],
+    ) -> str:
+        """Attach logical precision metadata as a module attribute."""
+
+        mlir_text = self._coerce_mlir_text(mlir_module)
+        return self._inject_precision_attr(mlir_text, normalize_precision(precision))
 
     def optimize_and_codegen(
         self,
@@ -286,6 +323,70 @@ class ARIESBackend:
                     f"aries.sparse_mapping = \"{payload}\""
                     "} {"
                 )
+                return "\n".join(lines) + "\n"
+
+        raise ValueError("Expected MLIR text to contain a top-level `module {` block")
+
+    def _inject_sparse_format_attr(self, mlir_text: str, sparse_format: SparseFormat) -> str:
+        lines = mlir_text.splitlines()
+        if not lines:
+            raise ValueError("Empty MLIR module text")
+
+        payload = sparse_format.value
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("module attributes {"):
+                if "aries.sparse_format" in line:
+                    return mlir_text
+                marker = "} {"
+                pos = line.find(marker)
+                if pos < 0:
+                    continue
+                before = line[:pos].rstrip()
+                after = line[pos:]
+                if before.endswith("{"):
+                    before = f'{before} aries.sparse_format = "{payload}"'
+                else:
+                    before = f'{before}, aries.sparse_format = "{payload}"'
+                lines[i] = f"{before}{after}"
+                return "\n".join(lines) + "\n"
+
+            if stripped == "module {":
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[i] = f'{indent}module attributes {{aries.sparse_format = "{payload}"}} {{'
+                return "\n".join(lines) + "\n"
+
+        raise ValueError("Expected MLIR text to contain a top-level `module {` block")
+
+    def _inject_precision_attr(self, mlir_text: str, precision: Precision) -> str:
+        lines = mlir_text.splitlines()
+        if not lines:
+            raise ValueError("Empty MLIR module text")
+
+        payload = precision.value
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("module attributes {"):
+                if "aries.precision" in line:
+                    return mlir_text
+                marker = "} {"
+                pos = line.find(marker)
+                if pos < 0:
+                    continue
+                before = line[:pos].rstrip()
+                after = line[pos:]
+                if before.endswith("{"):
+                    before = f'{before} aries.precision = "{payload}"'
+                else:
+                    before = f'{before}, aries.precision = "{payload}"'
+                lines[i] = f"{before}{after}"
+                return "\n".join(lines) + "\n"
+
+            if stripped == "module {":
+                indent = line[: len(line) - len(line.lstrip())]
+                lines[i] = f'{indent}module attributes {{aries.precision = "{payload}"}} {{'
                 return "\n".join(lines) + "\n"
 
         raise ValueError("Expected MLIR text to contain a top-level `module {` block")

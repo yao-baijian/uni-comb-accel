@@ -92,4 +92,4 @@ Add new primitive lowerings in `JaxprToMLIR._lower_eqn`:
 1. Match primitive name.
 2. Add lowering helper producing MLIR ops.
 3. Map output vars into `_var_map`.
-4. Add tests in `benchmarks/test_autodiff.py` for numerical + structural checks.
+4. Add tests in `tests/test_autodiff.py` for numerical + structural checks.
