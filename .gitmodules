@@ -1,0 +1,6 @@
+[submodule "tools/ARIES"]
+	path = tools/ARIES
+	url = https://github.com/arc-research-lab/Aries
+[submodule "tools/FEM"]
+	path = tools/FEM
+	url = https://github.com/Fanerst/FEM

@@ -1,0 +1,22 @@
+# Build outputs
+build/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Benchmark artifacts
+benchmarks/results/
+
+# Environment files
+.env
+.venv/
+venv/
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+tools/*
