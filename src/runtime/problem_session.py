@@ -135,6 +135,9 @@ class ProblemSessionManager:
         variables=None,
         expected_input_shapes: Optional[Mapping[str, Sequence[int]]] = None,
         auto_aie_config: bool = True,
+        shape_policy: str = "exact",
+        shape_buckets: Optional[Mapping[str, Sequence[Sequence[int]]]] = None,
+        max_shape: Optional[Mapping[str, Sequence[int]]] = None,
     ) -> ProblemHandle:
         """Define and (if needed) compile a problem.
 
@@ -150,6 +153,9 @@ class ProblemSessionManager:
             precision=precision,
             expected_input_shapes=expected_input_shapes,
             auto_aie_config=auto_aie_config,
+            shape_policy=shape_policy,
+            shape_buckets=shape_buckets,
+            max_shape=max_shape,
         )
         problem_id = self._hash_signature(signature)
         problem_dir = self.cache_root / problem_id
@@ -180,6 +186,9 @@ class ProblemSessionManager:
             precision=precision,
             expected_input_shapes=expected_input_shapes,
             auto_aie_config=auto_aie_config,
+            shape_policy=shape_policy,
+            shape_buckets=shape_buckets,
+            max_shape=max_shape,
         )
 
         manifest = {
@@ -246,9 +255,11 @@ class ProblemSessionManager:
         if not isinstance(artifacts, dict):
             return None
 
-        # Ensure all recorded artifact files still exist before reusing.
+        # Ensure recorded artifact file paths still exist before reusing.
+        # Non-path metadata entries (for example target/precision/shape_policy)
+        # should not invalidate cache reuse.
         for _, path in artifacts.items():
-            if isinstance(path, str) and path:
+            if isinstance(path, str) and _looks_like_path(path):
                 if not Path(path).exists():
                     return None
 
@@ -265,6 +276,9 @@ class ProblemSessionManager:
         precision: str,
         expected_input_shapes: Optional[Mapping[str, Sequence[int]]],
         auto_aie_config: bool,
+        shape_policy: str,
+        shape_buckets: Optional[Mapping[str, Sequence[Sequence[int]]]],
+        max_shape: Optional[Mapping[str, Sequence[int]]],
     ) -> Dict[str, Any]:
         try:
             source = inspect.getsource(energy_function)
@@ -284,6 +298,15 @@ class ProblemSessionManager:
                 for k, v in (expected_input_shapes or {}).items()
             },
             "auto_aie_config": bool(auto_aie_config),
+            "shape_policy": str(shape_policy),
+            "shape_buckets": {
+                k: [[int(x) for x in shape] for shape in shapes]
+                for k, shapes in (shape_buckets or {}).items()
+            },
+            "max_shape": {
+                k: [int(x) for x in shape]
+                for k, shape in (max_shape or {}).items()
+            },
         }
 
     def _hash_signature(self, signature: Dict[str, Any]) -> str:
@@ -294,3 +317,29 @@ class ProblemSessionManager:
 def _artifact_fingerprint(artifacts: Dict[str, str]) -> str:
     payload = json.dumps(dict(artifacts), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _looks_like_path(value: str) -> bool:
+    text = str(value).strip()
+    if not text:
+        return False
+
+    # Absolute/relative paths and values with common file extensions are treated
+    # as file-like artifact entries that should exist on disk.
+    if text.startswith("/") or text.startswith("./") or text.startswith("../"):
+        return True
+    if "/" in text or "\\" in text:
+        return True
+
+    suffixes = (
+        ".mlir",
+        ".cc",
+        ".cpp",
+        ".c",
+        ".o",
+        ".a",
+        ".so",
+        ".json",
+        ".txt",
+    )
+    return text.lower().endswith(suffixes)

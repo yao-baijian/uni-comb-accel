@@ -1,23 +1,36 @@
-# Autodiff Frontend (JAX -> MLIR)
+# Autodiff Model
 
-## Overview
+## Scope
 
-`src/compiler/autodiff.py` provides a frontend bridge from user Python energy
-functions to MLIR by tracing JAXPR for both forward and backward computations.
+This document describes the autodiff frontend path that lowers user Python
+energy functions to MLIR using JAX tracing.
 
-Pipeline:
+Primary implementation file:
 
-1. `jax.make_jaxpr(func)(*example_args)` for forward graph.
-2. `jax.grad(func, argnums=... )` + `make_jaxpr` for backward graph.
-3. `JaxprToMLIR` lowers each JAXPR into a standalone MLIR `func.func`.
-4. `combine_modules` merges forward/backward into one module.
+- `src/compiler/autodiff.py`
 
-## OMEinsum Contraction Order Optimization
+Integration entrypoint:
 
-The frontend now supports optional contraction-order optimization through
-Julia packages `OMEinsum.jl` and `OMEinsumContractionOrders.jl`.
+- `src/api.py` via `compile_energy_function(...)`
 
-Install (in Julia):
+## Pipeline
+
+The current pipeline is:
+
+1. Trace forward graph with `jax.make_jaxpr(func)(*example_args)`.
+2. Trace backward graph with `jax.grad(...)` + `make_jaxpr`.
+3. Lower each JAXPR through `JaxprToMLIR` into `func.func`.
+4. Merge forward/backward modules using `combine_modules(...)`.
+
+## OMEinsum Integration
+
+Optional contraction-order optimization is supported via Julia packages:
+
+- `OMEinsum`
+- `OMEinsumContractionOrders`
+- `JSON`
+
+Install in Julia:
 
 ```julia
 using Pkg
@@ -26,47 +39,45 @@ Pkg.add("OMEinsumContractionOrders")
 Pkg.add("JSON")
 ```
 
-Python side behavior:
+Behavior:
 
-- `JaxprToMLIR` detects a pure 2D matrix-chain (`A @ B @ C @ ...`) in forward JAXPR.
-- It calls Julia to get pairwise contraction order.
-- If Julia or packages are unavailable, it falls back to Python DP order.
-- MLIR emits `linalg.matmul` in the optimized pairwise sequence.
+- Detects pure 2D matrix-chain patterns (`A @ B @ C @ ...`).
+- Queries Julia for pairwise contraction order.
+- Falls back to Python dynamic-programming order if Julia side is unavailable.
+- Emits optimized `linalg.matmul` sequence.
 
-Current scope: 2D matrix-chain contractions. General einsum hypergraph
-optimization is structured for extension but not fully lowered yet.
+Current optimization scope is matrix-chain contractions; general einsum
+hypergraph optimization is not fully lowered yet.
 
 ## Supported Primitives
 
 - Arithmetic: `add`, `sub`, `mul`, `div`, `neg`
-- Linear algebra: `dot_general` (lowered to `linalg.matmul`), `broadcast_in_dim`, `transpose`
+- Linear algebra: `dot_general`, `broadcast_in_dim`, `transpose`
 - Math: `exp`, `log`, `sin`, `cos`
-- Reduction: `reduce_sum` (`linalg.reduce` skeleton), `reduce_max` placeholder
+- Reduction: `reduce_sum` (skeleton), `reduce_max` (placeholder)
 - Utility: `reshape`, `squeeze`, `convert_element_type`, `copy`
 
 Unsupported primitives raise `NotImplementedError` with the primitive name.
 
-## Intermediate Storage Strategy
+## API Usage
 
-The converter emits explicit temporary `memref.alloc` / `memref.dealloc` for
-non-scalar intermediates to model the lifetime of forward-pass values that may
-be reused in backward lowering.
-
-Current implementation is a pragmatic frontend scaffold and can be extended to
-materialize real save-for-backward buffers and pass them as explicit arguments.
-
-## API Integration
-
-`src/api.py` exposes:
+Minimal usage:
 
 ```python
-compile_energy_function(func, example_args, target="aie", output_dir="build")
+from src.api import compile_energy_function
+
+artifacts = compile_energy_function(
+	func,
+	example_args,
+	target="aie",
+	output_dir="build",
+)
 ```
 
-OMEinsum knobs:
+With OMEinsum enabled (default):
 
 ```python
-compile_energy_function(
+artifacts = compile_energy_function(
 	func,
 	example_args,
 	target="aie",
@@ -76,20 +87,31 @@ compile_energy_function(
 )
 ```
 
-It generates:
+Common generated files:
 
 - `<name>.forward.mlir`
 - `<name>.backward.mlir`
 - `<name>.combined.mlir`
 - `<name>.combined.opt.mlir`
 
-Then invokes ARIES backend for optimization/codegen.
+## Current Status
 
-## Extending Primitive Support
+Implemented and available:
 
-Add new primitive lowerings in `JaxprToMLIR._lower_eqn`:
+- forward/backward JAXPR tracing and MLIR generation
+- module merge and backend handoff
+- optional OMEinsum contraction order optimization
 
-1. Match primitive name.
-2. Add lowering helper producing MLIR ops.
-3. Map output vars into `_var_map`.
-4. Add tests in `tests/test_autodiff.py` for numerical + structural checks.
+Known gaps:
+
+- full general-einsum order optimization/lowering
+- richer save-for-backward buffer materialization
+
+## Extension Guide
+
+To add a new primitive:
+
+1. Extend dispatch in `JaxprToMLIR._lower_eqn`.
+2. Add a lowering helper that emits MLIR ops.
+3. Register output vars in internal maps.
+4. Add tests in `tests/test_autodiff.py` for numeric and structural checks.

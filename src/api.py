@@ -37,6 +37,9 @@ def compile_energy_function(
     precision: Union[str, Precision] = Precision.FP32,
     expected_input_shapes: Optional[Mapping[str, Sequence[int]]] = None,
     auto_aie_config: bool = True,
+    shape_policy: str = "exact",
+    shape_buckets: Optional[Mapping[str, Sequence[Sequence[int]]]] = None,
+    max_shape: Optional[Mapping[str, Sequence[int]]] = None,
 ):
     """
     将 Python 能量函数（含自动微分）编译为 AIE/PE 可执行代码。
@@ -73,17 +76,28 @@ def compile_energy_function(
     example_args = tuple(example_args)
     example_args = _cast_example_args_to_precision(example_args, precision_value)
 
+    arg_names = list(inspect.signature(func).parameters.keys())
+    actual_input_shapes = _resolve_input_shapes(func, example_args, expected_input_shapes=None)
+    compile_input_shapes = _select_compile_shapes(
+        arg_names=arg_names,
+        actual_shapes=actual_input_shapes,
+        shape_policy=shape_policy,
+        shape_buckets=shape_buckets,
+        max_shape=max_shape,
+    )
+    trace_args = _build_trace_args_for_shapes(arg_names, example_args, compile_input_shapes)
+
     aie_config = _build_aie_config(
         func=func,
-        example_args=example_args,
-        expected_input_shapes=expected_input_shapes,
+        example_args=trace_args,
+        expected_input_shapes=compile_input_shapes,
         auto_aie_config=auto_aie_config,
     )
 
     # 1. 自动微分并生成 forward/backward MLIR
     fwd_mod, bwd_mod = get_forward_backward_mlir(
         func,
-        example_args,
+        trace_args,
         optimize_contractions=use_omeinsum,
         julia_cmd=julia_cmd,
     )
@@ -132,6 +146,9 @@ def compile_energy_function(
         "sparse_format": sparse_format_value.value,
         "precision": precision_value.value,
         "aie_config": str(aie_cfg_path),
+        "shape_policy": str(shape_policy),
+        "actual_input_shapes": json.dumps(actual_input_shapes),
+        "compile_input_shapes": json.dumps(compile_input_shapes),
     }
 
     # 3. 调用 ARIES 代码生成
@@ -186,7 +203,10 @@ def compile_energy_function_legacy(
     )
 
     var_specs = _normalize_variable_specs(func, variables, precision_value)
-    frontend = PythonToMLIR(variable_specs=var_specs)
+    frontend = PythonToMLIR(
+        variable_specs=var_specs,
+        return_dtype=precision_value.mlir_dtype,
+    )
     mlir_module = frontend.lower(func, output="text")
 
     out_dir = Path(output_dir)
@@ -374,6 +394,96 @@ def _resolve_input_shapes(
         else:
             resolved[name] = (1024,)
     return resolved
+
+
+def _select_compile_shapes(
+    *,
+    arg_names: Sequence[str],
+    actual_shapes: Mapping[str, Tuple[int, ...]],
+    shape_policy: str,
+    shape_buckets: Optional[Mapping[str, Sequence[Sequence[int]]]],
+    max_shape: Optional[Mapping[str, Sequence[int]]],
+) -> Dict[str, Tuple[int, ...]]:
+    policy = str(shape_policy).strip().lower()
+    if policy not in {"exact", "bucket", "max_shape"}:
+        raise ValueError("shape_policy must be one of: 'exact', 'bucket', 'max_shape'")
+
+    if policy == "exact":
+        return {k: tuple(v) for k, v in actual_shapes.items()}
+
+    if policy == "max_shape":
+        if not max_shape:
+            raise ValueError("shape_policy='max_shape' requires max_shape mapping")
+        out: Dict[str, Tuple[int, ...]] = {}
+        for name in arg_names:
+            act = tuple(actual_shapes.get(name, (1024,)))
+            lim = tuple(int(x) for x in max_shape.get(name, ()))
+            if not lim:
+                raise ValueError(f"max_shape is missing shape for argument '{name}'")
+            _validate_shape_within(act, lim, context=f"arg '{name}'")
+            out[name] = lim
+        return out
+
+    # bucket
+    if not shape_buckets:
+        raise ValueError("shape_policy='bucket' requires shape_buckets mapping")
+
+    out = {}
+    for name in arg_names:
+        act = tuple(actual_shapes.get(name, (1024,)))
+        cands = [tuple(int(x) for x in s) for s in shape_buckets.get(name, ())]
+        if not cands:
+            raise ValueError(f"shape_buckets is missing candidates for argument '{name}'")
+        fitting = [s for s in cands if _shape_fits(act, s)]
+        if not fitting:
+            raise ValueError(
+                f"No bucket can cover input shape {act} for argument '{name}'. "
+                f"Candidates: {cands}"
+            )
+        fitting.sort(key=lambda s: _num_elements(s))
+        out[name] = fitting[0]
+    return out
+
+
+def _shape_fits(actual: Tuple[int, ...], limit: Tuple[int, ...]) -> bool:
+    if len(actual) != len(limit):
+        return False
+    return all(int(a) <= int(b) for a, b in zip(actual, limit))
+
+
+def _validate_shape_within(actual: Tuple[int, ...], limit: Tuple[int, ...], context: str) -> None:
+    if not _shape_fits(actual, limit):
+        raise ValueError(f"Input shape {actual} exceeds compile shape {limit} for {context}")
+
+
+def _build_trace_args_for_shapes(
+    arg_names: Sequence[str],
+    example_args,
+    compile_shapes: Mapping[str, Tuple[int, ...]],
+):
+    try:
+        import numpy as np
+    except Exception:
+        return example_args
+
+    trace = []
+    for idx, name in enumerate(arg_names):
+        if idx >= len(example_args):
+            break
+        value = example_args[idx]
+        tgt = tuple(compile_shapes.get(name, getattr(value, "shape", (1024,))))
+        src = tuple(getattr(value, "shape", ()))
+
+        if src == tgt:
+            trace.append(value)
+            continue
+
+        dtype = getattr(value, "dtype", np.float32)
+        if len(tgt) == 0:
+            trace.append(np.array(0, dtype=dtype))
+        else:
+            trace.append(np.zeros(tgt, dtype=dtype))
+    return tuple(trace)
 
 
 def _estimate_intermediate_elements(input_shapes: Mapping[str, Tuple[int, ...]]) -> int:
