@@ -7,3 +7,9 @@ from .problem_session import (
 	ProblemHandle,
 	ProblemSessionManager,
 )
+from .problem_solver_spec import (
+	ProblemSpec,
+	SolverSpec,
+	build_problem_spec,
+	build_solver_spec,
+)

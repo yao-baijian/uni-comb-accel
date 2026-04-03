@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from src.api import compile_energy_function
+from src.runtime.problem_solver_spec import (
+    ProblemSpec,
+    SolverSpec,
+    build_problem_spec,
+    build_solver_spec,
+)
 
 
 @dataclass
@@ -18,6 +24,9 @@ class ProblemHandle:
 
     problem_id: str
     problem_type: str
+    solver_type: str
+    problem_key: str
+    solver_key: str
     problem_dir: str
     manifest_path: str
     artifacts: Dict[str, str]
@@ -126,6 +135,13 @@ class ProblemSessionManager:
         energy_function: Callable[..., Any],
         example_args,
         *,
+        solver_type: str = "sb",
+        problem: Optional[ProblemSpec] = None,
+        solver: Optional[SolverSpec] = None,
+        problem_data_format: str = "generic",
+        problem_metadata: Optional[Mapping[str, Any]] = None,
+        solver_config: Optional[Mapping[str, Any]] = None,
+        solver_metadata: Optional[Mapping[str, Any]] = None,
         target: str = "aie",
         gradient_mode: str = "auto",
         sparse_format: str = "tcsr",
@@ -144,8 +160,28 @@ class ProblemSessionManager:
         Reuses prebuilt AIE artifacts when the problem signature is unchanged.
         """
 
+        problem_spec = problem or build_problem_spec(
+            problem_type,
+            data_format=problem_data_format,
+            name=problem_type,
+            metadata=problem_metadata,
+        )
+        solver_spec = solver or build_solver_spec(
+            solver_type,
+            config=solver_config,
+            metadata=solver_metadata,
+        )
+
+        normalized_problem_type = problem_spec.normalized_type()
+        normalized_solver_type = solver_spec.normalized_type()
+        problem_sig = problem_spec.signature_dict()
+        solver_sig = solver_spec.signature_dict()
+        problem_key = self._hash_signature(problem_sig)
+        solver_key = self._hash_signature(solver_sig)
+
         signature = self._build_signature(
-            problem_type=problem_type,
+            problem=problem_sig,
+            solver=solver_sig,
             energy_function=energy_function,
             target=target,
             gradient_mode=gradient_mode,
@@ -163,9 +199,16 @@ class ProblemSessionManager:
 
         existing = self._load_manifest_if_valid(manifest_path)
         if existing is not None:
+            saved_problem_type = existing.get("problem_type", normalized_problem_type)
+            saved_solver_type = existing.get("solver_type", normalized_solver_type)
+            saved_problem_key = existing.get("problem_key", problem_key)
+            saved_solver_key = existing.get("solver_key", solver_key)
             return ProblemHandle(
                 problem_id=problem_id,
-                problem_type=problem_type,
+                problem_type=str(saved_problem_type),
+                solver_type=str(saved_solver_type),
+                problem_key=str(saved_problem_key),
+                solver_key=str(saved_solver_key),
                 problem_dir=str(problem_dir),
                 manifest_path=str(manifest_path),
                 artifacts=dict(existing.get("artifacts", {})),
@@ -178,6 +221,7 @@ class ProblemSessionManager:
             example_args,
             target=target,
             output_dir=str(problem_dir),
+            problem_name=normalized_problem_type,
             use_omeinsum=use_omeinsum,
             julia_cmd=julia_cmd,
             gradient_mode=gradient_mode,
@@ -193,7 +237,12 @@ class ProblemSessionManager:
 
         manifest = {
             "problem_id": problem_id,
-            "problem_type": problem_type,
+            "problem_type": normalized_problem_type,
+            "solver_type": normalized_solver_type,
+            "problem_spec": problem_sig,
+            "solver_spec": solver_sig,
+            "problem_key": problem_key,
+            "solver_key": solver_key,
             "signature": signature,
             "artifacts": artifacts,
         }
@@ -201,7 +250,10 @@ class ProblemSessionManager:
 
         return ProblemHandle(
             problem_id=problem_id,
-            problem_type=problem_type,
+            problem_type=normalized_problem_type,
+            solver_type=normalized_solver_type,
+            problem_key=problem_key,
+            solver_key=solver_key,
             problem_dir=str(problem_dir),
             manifest_path=str(manifest_path),
             artifacts=dict(artifacts),
@@ -268,7 +320,8 @@ class ProblemSessionManager:
     def _build_signature(
         self,
         *,
-        problem_type: str,
+        problem: Mapping[str, Any],
+        solver: Mapping[str, Any],
         energy_function: Callable[..., Any],
         target: str,
         gradient_mode: str,
@@ -286,7 +339,8 @@ class ProblemSessionManager:
             source = repr(energy_function)
 
         return {
-            "problem_type": str(problem_type),
+            "problem": dict(problem),
+            "solver": dict(solver),
             "function_name": getattr(energy_function, "__name__", "anonymous"),
             "function_source": source,
             "target": str(target),

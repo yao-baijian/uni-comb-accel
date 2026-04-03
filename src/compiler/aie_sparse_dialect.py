@@ -38,5 +38,5 @@ def dialect_summary() -> str:
     return (
         "Dialect: aie_sparse\n"
         "Operation: aie_sparse.spmv\n"
-        "Semantics: vec_out = sparse_matrix * vec_in (TCSR-backed kernel call)\n"
+        "Semantics: vec_out = sparse_matrix * vec_in (TCSR/CSR-backed kernel call)\n"
     )

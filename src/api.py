@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
@@ -40,6 +41,7 @@ def compile_energy_function(
     shape_policy: str = "exact",
     shape_buckets: Optional[Mapping[str, Sequence[Sequence[int]]]] = None,
     max_shape: Optional[Mapping[str, Sequence[int]]] = None,
+    problem_name: Optional[str] = None,
 ):
     """
     将 Python 能量函数（含自动微分）编译为 AIE/PE 可执行代码。
@@ -47,7 +49,7 @@ def compile_energy_function(
     - func: Python 函数
     - example_args: 示例输入（用于 JAX tracing），如 `(x,)` 或 `(X, Y)`
     - target: "aie" 或 "pe" 或 "hybrid"
-    - output_dir: 输出目录
+    - output_dir: 输出根目录（将在其下生成 mlir_compile/ 与 aie_compile/）
     """
 
     gradient_mode = str(gradient_mode).strip().lower()
@@ -69,6 +71,7 @@ def compile_energy_function(
             output_dir=output_dir,
             sparse_format=sparse_format_value,
             precision=precision_value,
+            problem_name=problem_name,
         )
 
     if not isinstance(example_args, (tuple, list)):
@@ -107,13 +110,15 @@ def compile_energy_function(
     bwd_text = module_to_text(bwd_mod)
     combined_text = module_to_text(combined_mod)
 
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    func_name = getattr(func, "__name__", "kernel")
+    base_problem_name = _normalize_problem_name(problem_name or getattr(func, "__name__", "kernel"))
+    compile_tag = _build_compile_tag(base_problem_name, precision_value, compile_input_shapes)
+    dirs = _ensure_compile_dirs(output_root=output_dir, compile_tag=compile_tag)
+    mlir_dir = dirs["mlir_dir"]
+    aie_dir = dirs["aie_dir"]
 
-    fwd_mlir_path = out_dir / f"{func_name}.forward.mlir"
-    bwd_mlir_path = out_dir / f"{func_name}.backward.mlir"
-    combined_mlir_path = out_dir / f"{func_name}.combined.mlir"
+    fwd_mlir_path = mlir_dir / f"{compile_tag}.forward.mlir"
+    bwd_mlir_path = mlir_dir / f"{compile_tag}.backward.mlir"
+    combined_mlir_path = mlir_dir / f"{compile_tag}.combined.mlir"
     fwd_mlir_path.write_text(fwd_text, encoding="utf-8")
     bwd_mlir_path.write_text(bwd_text, encoding="utf-8")
     combined_mlir_path.write_text(combined_text, encoding="utf-8")
@@ -131,9 +136,9 @@ def compile_energy_function(
         sparse_format=sparse_format_value,
         precision=precision_value,
     )
-    opt_mlir_path = out_dir / f"{func_name}.combined.opt.mlir"
+    opt_mlir_path = mlir_dir / f"{compile_tag}.combined.opt.mlir"
     opt_mlir_path.write_text(optimized_mlir, encoding="utf-8")
-    aie_cfg_path = out_dir / f"{func_name}.aie_config.json"
+    aie_cfg_path = mlir_dir / f"{compile_tag}.aie_config.json"
     aie_cfg_path.write_text(json.dumps(aie_config, indent=2), encoding="utf-8")
 
     artifacts: Dict[str, str] = {
@@ -149,24 +154,28 @@ def compile_energy_function(
         "shape_policy": str(shape_policy),
         "actual_input_shapes": json.dumps(actual_input_shapes),
         "compile_input_shapes": json.dumps(compile_input_shapes),
+        "problem_name": base_problem_name,
+        "compile_tag": compile_tag,
+        "mlir_output_dir": str(mlir_dir),
+        "aie_output_dir": str(aie_dir),
     }
 
     # 3. 调用 ARIES 代码生成
     if target == "aie":
-        code_path = out_dir / f"{func_name}_aie.cc"
+        code_path = aie_dir / f"{compile_tag}_aie.cc"
         backend.generate_aie_code(optimized_mlir, output_path=code_path, emit="cc")
         artifacts["code"] = str(code_path)
 
     elif target == "pe":
         # PE 目标先输出拆分后的 kernel MLIR，后续可接自定义 PE codegen。
-        pe_path = out_dir / f"{func_name}_pe.mlir"
+        pe_path = aie_dir / f"{compile_tag}_pe.mlir"
         backend.generate_aie_code(optimized_mlir, output_path=pe_path, emit="mlir")
         artifacts["code"] = str(pe_path)
 
     else:  # hybrid
         # 简化策略：同一份优化后 IR 同时导出 AIE C++ 与 PE kernel MLIR。
-        aie_path = out_dir / f"{func_name}_aie.cc"
-        pe_path = out_dir / f"{func_name}_pe.mlir"
+        aie_path = aie_dir / f"{compile_tag}_aie.cc"
+        pe_path = aie_dir / f"{compile_tag}_pe.mlir"
         backend.generate_aie_code(optimized_mlir, output_path=aie_path, emit="cc")
         backend.generate_aie_code(optimized_mlir, output_path=pe_path, emit="mlir")
         artifacts["aie_code"] = str(aie_path)
@@ -185,6 +194,7 @@ def compile_energy_function_legacy(
     precision: Union[str, Precision] = Precision.FP32,
     expected_input_shapes: Optional[Mapping[str, Sequence[int]]] = None,
     auto_aie_config: bool = True,
+    problem_name: Optional[str] = None,
 ):
     """Legacy entrypoint using handwritten Python AST frontend."""
 
@@ -209,11 +219,17 @@ def compile_energy_function_legacy(
     )
     mlir_module = frontend.lower(func, output="text")
 
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    func_name = getattr(func, "__name__", "kernel")
+    compile_shapes = {
+        k: tuple(int(x) for x in v)
+        for k, v in aie_config.get("input_shapes", {}).items()
+    }
+    base_problem_name = _normalize_problem_name(problem_name or getattr(func, "__name__", "kernel"))
+    compile_tag = _build_compile_tag(base_problem_name, precision_value, compile_shapes)
+    dirs = _ensure_compile_dirs(output_root=output_dir, compile_tag=compile_tag)
+    mlir_dir = dirs["mlir_dir"]
+    aie_dir = dirs["aie_dir"]
 
-    input_mlir_path = out_dir / f"{func_name}.mlir"
+    input_mlir_path = mlir_dir / f"{compile_tag}.mlir"
     input_mlir_path.write_text(mlir_module, encoding="utf-8")
 
     backend = ARIESBackend(
@@ -228,9 +244,9 @@ def compile_energy_function_legacy(
         sparse_format=sparse_format_value,
         precision=precision_value,
     )
-    opt_mlir_path = out_dir / f"{func_name}.opt.mlir"
+    opt_mlir_path = mlir_dir / f"{compile_tag}.opt.mlir"
     opt_mlir_path.write_text(optimized_mlir, encoding="utf-8")
-    aie_cfg_path = out_dir / f"{func_name}.aie_config.json"
+    aie_cfg_path = mlir_dir / f"{compile_tag}.aie_config.json"
     aie_cfg_path.write_text(json.dumps(aie_config, indent=2), encoding="utf-8")
 
     artifacts: Dict[str, str] = {
@@ -241,19 +257,23 @@ def compile_energy_function_legacy(
         "sparse_format": sparse_format_value.value,
         "precision": precision_value.value,
         "aie_config": str(aie_cfg_path),
+        "problem_name": base_problem_name,
+        "compile_tag": compile_tag,
+        "mlir_output_dir": str(mlir_dir),
+        "aie_output_dir": str(aie_dir),
     }
 
     if target == "aie":
-        code_path = out_dir / f"{func_name}_aie.cc"
+        code_path = aie_dir / f"{compile_tag}_aie.cc"
         backend.generate_aie_code(optimized_mlir, output_path=code_path, emit="cc")
         artifacts["code"] = str(code_path)
     elif target == "pe":
-        pe_path = out_dir / f"{func_name}_pe.mlir"
+        pe_path = aie_dir / f"{compile_tag}_pe.mlir"
         backend.generate_aie_code(optimized_mlir, output_path=pe_path, emit="mlir")
         artifacts["code"] = str(pe_path)
     else:
-        aie_path = out_dir / f"{func_name}_aie.cc"
-        pe_path = out_dir / f"{func_name}_pe.mlir"
+        aie_path = aie_dir / f"{compile_tag}_aie.cc"
+        pe_path = aie_dir / f"{compile_tag}_pe.mlir"
         backend.generate_aie_code(optimized_mlir, output_path=aie_path, emit="cc")
         backend.generate_aie_code(optimized_mlir, output_path=pe_path, emit="mlir")
         artifacts["aie_code"] = str(aie_path)
@@ -394,6 +414,44 @@ def _resolve_input_shapes(
         else:
             resolved[name] = (1024,)
     return resolved
+
+
+def _normalize_problem_name(name: str) -> str:
+    cleaned = re.sub(r"[^0-9a-zA-Z_]+", "_", str(name).strip().lower())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or "kernel"
+
+
+def _shape_suffix(input_shapes: Mapping[str, Tuple[int, ...]]) -> str:
+    for shape in input_shapes.values():
+        if len(shape) >= 2:
+            return "x".join(str(int(dim)) for dim in shape)
+
+    for shape in input_shapes.values():
+        if len(shape) == 1:
+            return str(int(shape[0]))
+
+    return "shape_unknown"
+
+
+def _build_compile_tag(
+    problem_name: str,
+    precision: Precision,
+    input_shapes: Mapping[str, Tuple[int, ...]],
+) -> str:
+    return f"{problem_name}_{precision.value}_{_shape_suffix(input_shapes)}"
+
+
+def _ensure_compile_dirs(output_root: Union[str, Path], compile_tag: str) -> Dict[str, Path]:
+    root = Path(output_root)
+    mlir_dir = root / "mlir_compile" / compile_tag
+    aie_dir = root / "aie_compile" / compile_tag
+    mlir_dir.mkdir(parents=True, exist_ok=True)
+    aie_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "mlir_dir": mlir_dir,
+        "aie_dir": aie_dir,
+    }
 
 
 def _select_compile_shapes(
@@ -554,6 +612,45 @@ def define_problem(*args, **kwargs):
 
     session = get_problem_session()
     return session.define_problem(*args, **kwargs)
+
+
+def define_problem_with_solver(
+    *,
+    problem_type: str,
+    solver_type: str,
+    energy_function,
+    example_args,
+    **kwargs,
+):
+    """Define a problem with explicit problem-type and solver-type separation."""
+
+    session = get_problem_session()
+    return session.define_problem(
+        problem_type=problem_type,
+        solver_type=solver_type,
+        energy_function=energy_function,
+        example_args=example_args,
+        **kwargs,
+    )
+
+
+def define_lp_problem(
+    energy_function,
+    example_args,
+    *,
+    solver_type: str = "pdlp",
+    **kwargs,
+):
+    """Convenience API for LP problem definitions with pluggable solver type."""
+
+    session = get_problem_session()
+    return session.define_problem(
+        problem_type="lp",
+        solver_type=solver_type,
+        energy_function=energy_function,
+        example_args=example_args,
+        **kwargs,
+    )
 
 
 def solve_problem(*args, **kwargs):

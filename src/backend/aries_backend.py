@@ -94,7 +94,10 @@ class ARIESBackend:
         mlir_text = self._inject_sparse_format_attr(mlir_text, sparse_format_value)
         mlir_text = self._inject_precision_attr(mlir_text, precision_value)
 
-        if self.config.enable_sparse_lowering and sparse_format_value == SparseFormat.TCSR:
+        if self.config.enable_sparse_lowering and sparse_format_value in {
+            SparseFormat.TCSR,
+            SparseFormat.CSR,
+        }:
             sparse_result = self._sparse_pass.run(mlir_text)
             mlir_text = sparse_result.transformed_mlir
 

@@ -21,7 +21,7 @@ except Exception:
     jnp = None
     _HAS_JAX = False
 
-from src.api import compile_energy_function
+from src.api import compile_energy_function, define_lp_problem
 from src.runtime.problem_session import ProblemSessionManager
 
 
@@ -135,3 +135,71 @@ def test_shape_policy_cache_hit_and_recompile(tmp_path, monkeypatch) -> None:
     assert calls["count"] == 2
     assert h3.reused_artifacts is False
     assert h3.problem_id != h1.problem_id
+
+
+def test_problem_solver_split_and_lp_support(tmp_path, monkeypatch) -> None:
+    """LP problems can be defined with explicit solver separation and stable per-problem keys."""
+
+    calls = {"count": 0}
+
+    def fake_compile_energy_function(
+        func,
+        example_args,
+        target="aie",
+        output_dir="build",
+        **kwargs,
+    ):
+        calls["count"] += 1
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        marker = out_dir / f"lp_artifact_{calls['count']}.txt"
+        marker.write_text("ok", encoding="utf-8")
+        return {
+            "optimized_mlir": str(marker),
+            "code": str(marker),
+            "target": target,
+            "problem_name": str(kwargs.get("problem_name", "")),
+        }
+
+    monkeypatch.setattr(
+        "src.runtime.problem_session.compile_energy_function",
+        fake_compile_energy_function,
+    )
+
+    manager = ProblemSessionManager(cache_dir=str(tmp_path / "problem_cache"))
+
+    def lp_energy(x):
+        return float(np.sum(np.asarray(x)))
+
+    h_pdlp = manager.define_problem(
+        problem_type="lp",
+        solver_type="pdlp",
+        energy_function=lp_energy,
+        example_args=(np.zeros((8,), dtype=np.float32),),
+    )
+    h_sb = manager.define_problem(
+        problem_type="lp",
+        solver_type="sb",
+        energy_function=lp_energy,
+        example_args=(np.zeros((8,), dtype=np.float32),),
+    )
+
+    assert calls["count"] == 2
+    assert h_pdlp.problem_type == "lp"
+    assert h_pdlp.solver_type == "pdlp"
+    assert h_sb.solver_type == "sb"
+    assert h_pdlp.problem_key == h_sb.problem_key
+    assert h_pdlp.solver_key != h_sb.solver_key
+
+    # Top-level LP helper should use the same split model.
+    monkeypatch.setattr(
+        "src.api.get_problem_session",
+        lambda cache_dir="build/problem_cache": manager,
+    )
+    h_lp = define_lp_problem(
+        lp_energy,
+        example_args=(np.zeros((8,), dtype=np.float32),),
+        solver_type="pdlp",
+    )
+    assert h_lp.problem_type == "lp"
+    assert h_lp.solver_type == "pdlp"

@@ -4,6 +4,7 @@
 
 - OS: Linux (validated on Ubuntu-like environments)
 - Python: 3.11+
+- Julia: 1.10+ (optional, for OMEinsum contraction-order optimization)
 - Git + submodule support
 - C/C++ toolchain: `clang`, `lld`, `ninja`, `cmake`
 - Python packages: see `requirements.txt`
@@ -28,6 +29,12 @@ git submodule update --init --recursive
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+### 2.2.1 Optional Julia packages (for OMEinsum)
+
+```bash
+julia -e 'using Pkg; Pkg.add(["OMEinsum", "OMEinsumContractionOrders", "JSON"])'
 ```
 
 ### 2.3 Build ARIES subproject
@@ -77,20 +84,21 @@ artifacts = compile_energy_function(
     energy,
     example_args=(x,),
     target="aie",
-    output_dir="build/real_compile_manual",
+    output_dir="build",
     gradient_mode="manual",
+    problem_name="maxcut",
     variables={"x": {"shape": (4,)}},
 )
 
 print(artifacts)
 ```
 
-Expected local outputs:
+Expected local outputs (for this example, compile tag is `maxcut_fp32_4`):
 
-- `build/real_compile_manual/energy.mlir`
-- `build/real_compile_manual/energy.opt.mlir`
-- `build/real_compile_manual/energy_aie.cc`
-- `build/real_compile_manual/energy.aie_config.json`
+- `build/mlir_compile/maxcut_fp32_4/maxcut_fp32_4.mlir`
+- `build/mlir_compile/maxcut_fp32_4/maxcut_fp32_4.opt.mlir`
+- `build/mlir_compile/maxcut_fp32_4/maxcut_fp32_4.aie_config.json`
+- `build/aie_compile/maxcut_fp32_4/maxcut_fp32_4_aie.cc`
 
 ## Top-Level and First-Level Architecture
 
