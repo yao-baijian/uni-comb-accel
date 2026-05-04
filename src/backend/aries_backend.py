@@ -98,7 +98,12 @@ class ARIESBackend:
             SparseFormat.TCSR,
             SparseFormat.CSR,
         }:
-            sparse_result = self._sparse_pass.run(mlir_text)
+            sparse_pass = SparseToAIEPass(
+                tile_rows=self.config.sparse_tile_rows,
+                tile_cols=self.config.sparse_tile_cols,
+                sparse_format=sparse_format_value,
+            )
+            sparse_result = sparse_pass.run(mlir_text)
             mlir_text = sparse_result.transformed_mlir
 
         if sparse_mapping:

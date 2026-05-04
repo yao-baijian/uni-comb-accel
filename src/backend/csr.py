@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 import numpy as np
 
@@ -43,6 +43,45 @@ class CSRData:
             f"static const int {prefix}_col_indices[] = {{{cols}}};\n"
             f"static const int {prefix}_row_ptr[] = {{{row_ptr}}};\n"
         )
+
+
+def csr_from_payload(
+    payload: Mapping[str, Any],
+    dtype: np.dtype = np.float32,
+) -> CSRData:
+    """Build ``CSRData`` from a serialized payload.
+
+    Expected payload keys: ``values``, ``col_indices``, ``row_ptr``, ``shape``.
+    """
+
+    required = ("values", "col_indices", "row_ptr", "shape")
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise ValueError(f"CSR payload missing keys: {missing}")
+
+    shape_raw = payload["shape"]
+    if not isinstance(shape_raw, (list, tuple)) or len(shape_raw) != 2:
+        raise ValueError("CSR payload 'shape' must be a 2-element list/tuple")
+
+    rows = int(shape_raw[0])
+    cols = int(shape_raw[1])
+
+    values = np.asarray(payload["values"], dtype=dtype)
+    col_indices = np.asarray(payload["col_indices"], dtype=np.int32)
+    row_ptr = np.asarray(payload["row_ptr"], dtype=np.int32)
+
+    if row_ptr.ndim != 1 or row_ptr.size != rows + 1:
+        raise ValueError("CSR payload row_ptr length must be rows + 1")
+
+    if values.ndim != 1 or col_indices.ndim != 1 or values.size != col_indices.size:
+        raise ValueError("CSR payload values/col_indices must be 1D with same length")
+
+    return CSRData(
+        values=values,
+        col_indices=col_indices,
+        row_ptr=row_ptr,
+        shape=(rows, cols),
+    )
 
 
 def generate_csr(

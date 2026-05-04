@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from src.backend.csr import CSRData, generate_csr
+from src.backend.csr import CSRData, csr_from_payload, generate_csr
 from src.backend.tcsr import TCSRData, generate_tcsr
 from src.backend.sparse_formats import SparseFormat, normalize_sparse_format
 
@@ -61,18 +61,22 @@ class SparseToAIEPass:
                 changed=False,
             )
 
-        matrix = self._extract_sparse_matrix_payload(mlir_text)
-        if matrix is None:
-            # No compile-time sparse payload. Keep original IR untouched.
-            return SparseLoweringResult(
-                transformed_mlir=mlir_text,
-                tcsr=None,
-                csr=None,
-                changed=False,
-            )
-
         if self.sparse_format == SparseFormat.CSR:
-            csr = generate_csr(matrix)
+            csr_payload = self._extract_csr_payload(mlir_text)
+            if csr_payload is not None:
+                csr = csr_from_payload(csr_payload)
+            else:
+                matrix = self._extract_sparse_matrix_payload(mlir_text)
+                if matrix is None:
+                    # No compile-time sparse payload. Keep original IR untouched.
+                    return SparseLoweringResult(
+                        transformed_mlir=mlir_text,
+                        tcsr=None,
+                        csr=None,
+                        changed=False,
+                    )
+                csr = generate_csr(matrix)
+
             transformed = mlir_text
             transformed = self._inject_csr_metadata(transformed, csr)
             transformed = self._inject_csr_globals(transformed, csr)
@@ -83,6 +87,16 @@ class SparseToAIEPass:
                 tcsr=None,
                 csr=csr,
                 changed=True,
+            )
+
+        matrix = self._extract_sparse_matrix_payload(mlir_text)
+        if matrix is None:
+            # No compile-time sparse payload. Keep original IR untouched.
+            return SparseLoweringResult(
+                transformed_mlir=mlir_text,
+                tcsr=None,
+                csr=None,
+                changed=False,
             )
 
         tcsr = generate_tcsr(matrix, tile_rows=self.tile_rows, tile_cols=self.tile_cols)
@@ -134,6 +148,22 @@ class SparseToAIEPass:
             return json.loads(unescaped)
         except json.JSONDecodeError:
             return None
+
+    def _extract_csr_payload(self, mlir_text: str) -> Optional[Dict[str, Any]]:
+        m = re.search(r'aries\.csr_input\s*=\s*"(?P<payload>(?:\\.|[^"\\])*)"', mlir_text)
+        if m is None:
+            return None
+
+        raw = m.group("payload")
+        unescaped = raw.replace('\\"', '"')
+        try:
+            payload = json.loads(unescaped)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        return payload
 
     def _inject_tcsr_metadata(self, mlir_text: str, tcsr: TCSRData) -> str:
         payload = json.dumps(tcsr.to_dict(), separators=(",", ":")).replace('"', '\\"')
